@@ -143,6 +143,7 @@ export default {
 
         this.renderer = new WebGLRenderer( { antialias: true, alpha: true, canvas: this.$refs.canvas } )
         this.renderer.shadowMap.enabled = true;
+        this.renderer.gammaOutput = true;
 
         this.scene.add( this.wrapper )
 
