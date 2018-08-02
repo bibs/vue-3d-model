@@ -220,7 +220,7 @@ export default {
     },
     methods: {
         onResize() {
-
+            this.updateModel()
             if ( this.width === undefined || this.height === undefined ) {
 
                 this.$nextTick( () => {
@@ -229,7 +229,6 @@ export default {
                         height: this.$el.offsetHeight
                     }
                 } )
-
             }
         },
         onMouseDown( event ) {
