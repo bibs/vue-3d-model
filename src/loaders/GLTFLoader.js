@@ -12,6 +12,7 @@ import { LoaderUtils } from './LoaderUtils.js'
 function GLTFLoader( manager ) {
 
     this.manager = ( manager !== undefined ) ? manager : THREE.DefaultLoadingManager;
+    this.dracoLoader = null;
 
 }
 
@@ -68,7 +69,19 @@ GLTFLoader.prototype = {
         return this;
 
     },
+    setResourcePath: function ( value ) {
 
+			this.resourcePath = value;
+			return this;
+
+		},
+
+		setDRACOLoader: function ( dracoLoader ) {
+
+			this.dracoLoader = dracoLoader;
+			return this;
+
+		},
     parse: function ( data, path, onLoad, onError ) {
 
         var content;
@@ -131,6 +144,11 @@ GLTFLoader.prototype = {
             if ( json.extensionsUsed.indexOf( EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS ) >= 0 ) {
 
                 extensions[ EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS ] = new GLTFMaterialsPbrSpecularGlossinessExtension();
+
+            }
+
+            if (json.extensionsUsed.indexOf( EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ) >= 0 ) {
+              extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ] = new GLTFDracoMeshCompressionExtension( json, this.dracoLoader );
 
             }
 
@@ -208,10 +226,93 @@ function GLTFRegistry() {
 
 var EXTENSIONS = {
     KHR_BINARY_GLTF: 'KHR_binary_glTF',
+    KHR_DRACO_MESH_COMPRESSION: 'KHR_draco_mesh_compression',
     KHR_LIGHTS: 'KHR_lights',
     KHR_MATERIALS_COMMON: 'KHR_materials_common',
     KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS: 'KHR_materials_pbrSpecularGlossiness'
 };
+
+
+/**
+	 * DRACO Mesh Compression Extension
+	 *
+	 * Specification: https://github.com/KhronosGroup/glTF/pull/874
+	 */
+	function GLTFDracoMeshCompressionExtension( json, dracoLoader ) {
+
+		if ( ! dracoLoader ) {
+
+			throw new Error( 'THREE.GLTFLoader: No DRACOLoader instance provided.' );
+
+		}
+
+		this.name = EXTENSIONS.KHR_DRACO_MESH_COMPRESSION;
+		this.json = json;
+		this.dracoLoader = dracoLoader;
+
+	}
+
+  GLTFDracoMeshCompressionExtension.prototype.decodePrimitive = function ( primitive, parser ) {
+
+    var json = this.json;
+    var dracoLoader = this.dracoLoader;
+    var bufferViewIndex = primitive.extensions[ this.name ].bufferView;
+    var gltfAttributeMap = primitive.extensions[ this.name ].attributes;
+    var threeAttributeMap = {};
+    var attributeNormalizedMap = {};
+    var attributeTypeMap = {};
+
+    for ( var attributeName in gltfAttributeMap ) {
+
+      var threeAttributeName = ATTRIBUTES[ attributeName ] || attributeName.toLowerCase();
+
+      threeAttributeMap[ threeAttributeName ] = gltfAttributeMap[ attributeName ];
+
+    }
+
+  for ( attributeName in primitive.attributes ) {
+
+    var threeAttributeName = ATTRIBUTES[ attributeName ] || attributeName.toLowerCase();
+
+    if ( gltfAttributeMap[ attributeName ] !== undefined ) {
+
+      var accessorDef = json.accessors[ primitive.attributes[ attributeName ] ];
+      var componentType = WEBGL_COMPONENT_TYPES[ accessorDef.componentType ];
+
+      attributeTypeMap[ threeAttributeName ] = componentType;
+      attributeNormalizedMap[ threeAttributeName ] = accessorDef.normalized === true;
+
+    }
+
+  }
+
+  return parser.getDependency( 'bufferView', bufferViewIndex ).then( function ( bufferView ) {
+
+    return new Promise( function ( resolve ) {
+
+      dracoLoader.decodeDracoFile( bufferView, function ( geometry ) {
+
+        for ( var attributeName in geometry.attributes ) {
+
+          var attribute = geometry.attributes[ attributeName ];
+          var normalized = attributeNormalizedMap[ attributeName ];
+
+          if ( normalized !== undefined ) attribute.normalized = normalized;
+
+        }
+
+        resolve( geometry );
+
+      }, threeAttributeMap, attributeTypeMap );
+
+    } );
+
+  } );
+
+};
+
+
+
 
 /**
  * Lights Extension
@@ -1179,6 +1280,69 @@ function addMorphTargets( mesh, meshDef, primitiveDef, accessors ) {
 
 }
 
+function createPrimitiveKey( primitiveDef ) {
+
+  var dracoExtension = primitiveDef.extensions && primitiveDef.extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ];
+  var geometryKey;
+
+  if ( dracoExtension ) {
+
+    geometryKey = 'draco:' + dracoExtension.bufferView
+      + ':' + dracoExtension.indices
+      + ':' + createAttributesKey( dracoExtension.attributes );
+
+  } else {
+
+    geometryKey = primitiveDef.indices + ':' + createAttributesKey( primitiveDef.attributes ) + ':' + primitiveDef.mode;
+
+  }
+
+  return geometryKey;
+
+}
+
+function createAttributesKey( attributes ) {
+
+		var attributesKey = '';
+
+		var keys = Object.keys( attributes ).sort();
+
+		for ( var i = 0, il = keys.length; i < il; i ++ ) {
+
+			attributesKey += keys[ i ] + ':' + attributes[ keys[ i ] ] + ';';
+
+		}
+
+		return attributesKey;
+
+	}
+
+  function cloneBufferAttribute( attribute ) {
+
+		if ( attribute.isInterleavedBufferAttribute ) {
+
+			var count = attribute.count;
+			var itemSize = attribute.itemSize;
+			var array = attribute.array.slice( 0, count * itemSize );
+
+			for ( var i = 0, j = 0; i < count; ++ i ) {
+
+				array[ j ++ ] = attribute.getX( i );
+				if ( itemSize >= 2 ) array[ j ++ ] = attribute.getY( i );
+				if ( itemSize >= 3 ) array[ j ++ ] = attribute.getZ( i );
+				if ( itemSize >= 4 ) array[ j ++ ] = attribute.getW( i );
+
+			}
+
+			return new THREE.BufferAttribute( array, itemSize, attribute.normalized );
+
+		}
+
+		return attribute.clone();
+
+	}
+
+
 function isPrimitiveEqual( a, b ) {
 
     if ( a.indices !== b.indices ) {
@@ -1499,6 +1663,16 @@ GLTFParser.prototype.loadAccessor = function ( accessorIndex ) {
     var json = this.json;
 
     var accessorDef = this.json.accessors[ accessorIndex ];
+
+    if ( accessorDef.bufferView === undefined && accessorDef.sparse === undefined ) {
+
+			// Ignore empty accessors, which may be used to declare runtime
+			// information about attributes coming from another source (e.g. Draco
+			// compression extension).
+			return Promise.resolve( null );
+
+		}
+
 
     var pendingBufferViews = [];
 
@@ -1890,115 +2064,133 @@ GLTFParser.prototype.loadMaterial = function ( materialIndex ) {
 };
 
 /**
- * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#geometry
- * @param {Array<Object>} primitives
- * @return {Promise<Array<THREE.BufferGeometry>>}
- */
-GLTFParser.prototype.loadGeometries = function ( primitives ) {
+	 * @param {THREE.BufferGeometry} geometry
+	 * @param {GLTF.Primitive} primitiveDef
+	 * @param {GLTFParser} parser
+	 * @return {Promise<THREE.BufferGeometry>}
+	 */
+	function addPrimitiveAttributes( geometry, primitiveDef, parser ) {
 
-    var cache = this.primitiveCache;
+		var attributes = primitiveDef.attributes;
 
-    return this.getDependencies( 'accessor' ).then( function ( accessors ) {
+		var pending = [];
 
-        var geometries = [];
+		function assignAttributeAccessor( accessorIndex, attributeName ) {
 
-        for ( var i = 0, il = primitives.length; i < il; i++ ) {
+			return parser.getDependency( 'accessor', accessorIndex )
+				.then( function ( accessor ) {
 
-            var primitive = primitives[ i ];
+					geometry.addAttribute( attributeName, accessor );
 
-            // See if we've already created this geometry
-            var cached = getCachedGeometry( cache, primitive );
+				} );
 
-            if ( cached ) {
+		}
 
-                // Use the cached geometry if it exists
-                geometries.push( cached );
+		for ( var gltfAttributeName in attributes ) {
 
-            } else {
+			var threeAttributeName = ATTRIBUTES[ gltfAttributeName ] || gltfAttributeName.toLowerCase();
 
-                // Otherwise create a new geometry
-                var geometry = new THREE.BufferGeometry();
+			// Skip attributes already provided by e.g. Draco extension.
+			if ( threeAttributeName in geometry.attributes ) continue;
 
-                var attributes = primitive.attributes;
+			pending.push( assignAttributeAccessor( attributes[ gltfAttributeName ], threeAttributeName ) );
 
-                for ( var attributeId in attributes ) {
+		}
 
-                    var attributeEntry = attributes[ attributeId ];
+		if ( primitiveDef.indices !== undefined && ! geometry.index ) {
 
-                    var bufferAttribute = accessors[ attributeEntry ];
+			var accessor = parser.getDependency( 'accessor', primitiveDef.indices ).then( function ( accessor ) {
 
-                    switch ( attributeId ) {
+				geometry.setIndex( accessor );
 
-                        case 'POSITION':
+			} );
 
-                            geometry.addAttribute( 'position', bufferAttribute );
-                            break;
+			pending.push( accessor );
 
-                        case 'NORMAL':
+		}
 
-                            geometry.addAttribute( 'normal', bufferAttribute );
-                            break;
+		assignExtrasToUserData( geometry, primitiveDef );
 
-                        case 'TEXCOORD_0':
-                        case 'TEXCOORD0':
-                        case 'TEXCOORD':
+		return Promise.all( pending ).then( function () {
 
-                            geometry.addAttribute( 'uv', bufferAttribute );
-                            break;
+			return primitiveDef.targets !== undefined
+				? addMorphTargets( geometry, primitiveDef.targets, parser )
+				: geometry;
 
-                        case 'TEXCOORD_1':
+		} );
 
-                            geometry.addAttribute( 'uv2', bufferAttribute );
-                            break;
+	}
 
-                        case 'COLOR_0':
-                        case 'COLOR0':
-                        case 'COLOR':
 
-                            geometry.addAttribute( 'color', bufferAttribute );
-                            break;
+  	/**
+  	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#geometry
+  	 *
+  	 * Creates BufferGeometries from primitives.
+  	 *
+  	 * @param {Array<GLTF.Primitive>} primitives
+  	 * @return {Promise<Array<THREE.BufferGeometry>>}
+  	 */
+  	GLTFParser.prototype.loadGeometries = function ( primitives ) {
 
-                        case 'WEIGHTS_0':
-                        case 'WEIGHT': // WEIGHT semantic deprecated.
+  		var parser = this;
+  		var extensions = this.extensions;
+  		var cache = this.primitiveCache;
 
-                            geometry.addAttribute( 'skinWeight', bufferAttribute );
-                            break;
+  		function createDracoPrimitive( primitive ) {
 
-                        case 'JOINTS_0':
-                        case 'JOINT': // JOINT semantic deprecated.
+  			return extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ]
+  				.decodePrimitive( primitive, parser )
+  				.then( function ( geometry ) {
 
-                            geometry.addAttribute( 'skinIndex', bufferAttribute );
-                            break;
+  					return addPrimitiveAttributes( geometry, primitive, parser );
 
-                    }
+  				} );
 
-                }
+  		}
 
-                if ( primitive.indices !== undefined ) {
+  		var pending = [];
 
-                    geometry.setIndex( accessors[ primitive.indices ] );
+  		for ( var i = 0, il = primitives.length; i < il; i ++ ) {
 
-                }
+  			var primitive = primitives[ i ];
+  			var cacheKey = createPrimitiveKey( primitive );
 
-                // Cache this geometry
-                cache.push( {
+  			// See if we've already created this geometry
+  			var cached = cache[ cacheKey ];
 
-                    primitive: primitive,
-                    geometry: geometry
+  			if ( cached ) {
 
-                } );
+  				// Use the cached geometry if it exists
+  				pending.push( cached.promise );
 
-                geometries.push( geometry );
+  			} else {
 
-            }
+  				var geometryPromise;
 
-        }
+  				if ( primitive.extensions && primitive.extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ] ) {
 
-        return geometries;
+  					// Use DRACO geometry if available
+  					geometryPromise = createDracoPrimitive( primitive );
 
-    } );
+  				} else {
 
-};
+  					// Otherwise create a new geometry
+  					geometryPromise = addPrimitiveAttributes( new THREE.BufferGeometry(), primitive, parser );
+
+  				}
+
+  				// Cache this geometry
+  				cache[ cacheKey ] = { primitive: primitive, promise: geometryPromise };
+
+  				pending.push( geometryPromise );
+
+  			}
+
+  		}
+
+  		return Promise.all( pending );
+
+  	};
 
 /**
  * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#meshes
